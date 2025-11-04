@@ -6,9 +6,13 @@ import logging
 import os
 import sys
 from transformers import BertTokenizer, BertForQuestionAnswering, AutoModelForNextSentencePrediction, AutoModelForTokenClassification, pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-from transformers import AutoTokenizer
 from modelos.extracao_votos.modeling_deberta_crf import DebertaCRFForTokenClassification
 import time
+from difflib import SequenceMatcher
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+import numpy as np
+from joblib import load
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 warnings.filterwarnings("ignore")
 
@@ -44,8 +48,9 @@ Modelo_3 = "modelos/divisao_segmentos"
 Modelo_4 = "modelos/anonimizacao"
 Modelo_5 = "modelos/sumarizacao_segmentos"
 Modelo_6 = "modelos/extracao_votos"
+Modelo_7 = "modelos/classificacao_topicos"
 
-logger.info(f"Caminhos dos modelos: {Modelo_1}, {Modelo_2}, {Modelo_3}, {Modelo_4}, {Modelo_5}, {Modelo_6}")
+logger.info(f"Caminhos dos modelos: {Modelo_1}, {Modelo_2}, {Modelo_3}, {Modelo_4}, {Modelo_5}, {Modelo_6}, {Modelo_7}")
 
 
 # ------------------------------- CACHE DE MODELOS -------------------------------
@@ -111,6 +116,19 @@ def get_modelo_extracao_votos():
         model.eval()
         model_cache["votos"] = (tokenizer, model)
     return model_cache["votos"]
+
+
+def get_modelo_classificacao_topicos():
+    if "topicos" not in model_cache:
+        logger.info("Carregando modelo 7 - Classificação de Tópicos")
+        tokenizer = AutoTokenizer.from_pretrained(Modelo_7)
+        model = AutoModelForSequenceClassification.from_pretrained(Modelo_7)
+        thresholds = np.load(os.path.join(Modelo_7, "optimal_thresholds.npy"))
+        mlb = load(os.path.join(Modelo_7, "mlb_encoder.joblib"))
+        model.eval()
+        model_cache["topicos"] = (tokenizer, model, thresholds, mlb)
+    return model_cache["topicos"]
+
 
 
 # ---------------------- MODELO 1: Divisão de documentos ----------------------
@@ -479,7 +497,6 @@ def segmentar_texto(sentencas, tokenizer, model, threshold=0.65):
 
 # ---------------------- MODELO 4: Anonimização ----------------------
 
-
 tokenizer_4 = AutoTokenizer.from_pretrained(Modelo_4)
 model_4 = AutoModelForTokenClassification.from_pretrained(Modelo_4)
 ner_pipeline_4 = pipeline(
@@ -488,6 +505,22 @@ ner_pipeline_4 = pipeline(
     tokenizer=tokenizer_4,
     aggregation_strategy="simple"
 )
+
+
+def normalizar_nome(nome):
+    nome = re.sub(r"\(.*?\)", "", nome)  # remove conteúdo entre parênteses
+    nome = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ\s]", "", nome)  # remove pontuação
+    return nome.strip().lower()
+
+def eh_nome_participante(ent_texto, participantes_norm, limiar=0.6):
+    ent_norm = normalizar_nome(ent_texto)
+    for nome_part in participantes_norm:
+        ratio = SequenceMatcher(None, ent_norm, nome_part).ratio()
+        if ratio >= limiar:
+            return True
+        if ent_norm in nome_part or nome_part in ent_norm:
+            return True
+    return False
 
 def dividir_texto(texto, max_tokens=500, overlap=20):
     logger.info(f"Dividindo texto em chunks (max_tokens={max_tokens}, overlap={overlap})")
@@ -500,7 +533,8 @@ def dividir_texto(texto, max_tokens=500, overlap=20):
         prefix_text = tokenizer_4.decode(prefix_tokens, skip_special_tokens=True)
         yield chunk_text, len(prefix_text)
 
-def anonimizar_texto(texto, ner_pipeline):
+
+def anonimizar_texto(texto, ner_pipeline, participantes_norm=None):
     if not isinstance(texto, str):
         logger.warning("Texto não é string. Retornando valor original.")
         return texto
@@ -550,11 +584,23 @@ def anonimizar_texto(texto, ner_pipeline):
 
         logger.info(f"{len(mescladas)} entidades mescladas no total")
         texto_anonimizado = list(texto)
+
         for ent in reversed(mescladas):
             start, end = ent["start"], ent["end"]
             if end - start < 3:
                 continue
-            texto_anonimizado[start:end] = "*" * (end - start)
+
+            ent_texto = texto[start:end]
+
+            if participantes_norm and eh_nome_participante(ent_texto, participantes_norm):
+                logger.info(f"Nome de participante detectado, não anonimizado: {ent_texto}")
+                continue
+
+            sub_text = texto[start:end]
+            tokens = re.findall(r"\S+", sub_text)
+            sub_anon = " ".join(["*****" for _ in tokens])
+
+            texto_anonimizado[start:end] = list(sub_anon)
 
         logger.info(f"Anonimização concluída em {time.time()-start_time:.2f}s")
         return "".join(texto_anonimizado)
@@ -563,14 +609,21 @@ def anonimizar_texto(texto, ner_pipeline):
         logger.exception(f"Erro durante anonimização: {e}")
         return texto
 
+
 def anonimizar_ata(data, ner_pipeline):
     logger.info("Iniciando anonimização de ata")
+
+    participantes_norm = []
+    if "participantes" in data and isinstance(data["participantes"], list):
+        participantes_norm = [normalizar_nome(p) for p in data["participantes"]]
+
     resultado = {}
     for key, value in data.items():
         if isinstance(value, str):
-            resultado[key] = anonimizar_texto(value, ner_pipeline)
+            resultado[key] = anonimizar_texto(value, ner_pipeline, participantes_norm)
         else:
             resultado[key] = value
+
     logger.info("Anonimização de ata concluída")
     return resultado
 
@@ -698,6 +751,63 @@ def processar_segmentos(data):
 
     logger.info(f"Processamento de segmentos concluído em {time.time() - start_time:.2f}s")
     return resultados
+
+
+# ---------------------- MODELO 7: Classificação de Tópicos ----------------------
+
+tokenizer_7, model_7, thresholds_7, mlb_7 = get_modelo_classificacao_topicos()
+
+def predict_topicos(text, tokenizer, model, thresholds, mlb, top_k=3, max_length=512, device=None):
+
+    if not text or not text.strip():
+        return []
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.sigmoid(outputs.logits.cpu()).numpy().ravel()
+
+    preds_bool = (probs >= thresholds).astype(int)
+    predicted_labels = list(mlb.inverse_transform(preds_bool.reshape(1, -1))[0])
+
+
+    if not predicted_labels:
+        top_indices = np.argsort(probs)[::-1][:top_k]
+        predicted_labels = [mlb.classes_[i] for i in top_indices]
+
+    return predicted_labels
+
+
+def classificar_topicos(data, tokenizer, model, thresholds, mlb):
+    logger.info("Iniciando classificação de tópicos dos segmentos")
+    resultado = {}
+    total_segmentos = 0
+
+    for key, value in data.items():
+        if isinstance(value, str) and key.startswith("segmento_"):
+            total_segmentos += 1
+            logger.info(f"Classificando segmento '{key}' ({len(value)} caracteres)")
+            topicos = predict_topicos(value, tokenizer, model, thresholds, mlb)
+            resultado[key] = value
+            resultado[f"topico_{key.split('_')[1]}"] = topicos
+        else:
+            resultado[key] = value
+
+    logger.info(f"Classificação de tópicos concluída para {total_segmentos} segmentos")
+    return resultado
 
 
 # ------------------------------- ROTAS ------------------------------------
@@ -828,7 +938,7 @@ def rota_sumarizacao():
         logger.warning("JSON inválido recebido na rota /sumarizacao_segmentos")
         return jsonify({"erro": "JSON inválido"}), 400
 
-
+    # Carrega o modelo de sumarização
     tokenizer_sum, model_sum = get_modelo_sumarizacao()
 
     summarized_data = {}
@@ -866,9 +976,36 @@ def rota_extracao_votos():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route("/classificacao_topicos", methods=["POST"])
+def rota_classificacao_topicos():
+    logger.info("Rota /classificacao_topicos chamada")
+    data = request.get_json()
+
+    if not data:
+        logger.warning("JSON inválido recebido na rota /classificacao_topicos")
+        return jsonify({"erro": "JSON inválido"}), 400
+
+    try:
+        if isinstance(data, list):
+            resultados = [
+                classificar_topicos(item, tokenizer_7, model_7, thresholds_7, mlb_7)
+                for item in data
+            ]
+            logger.info(f"Classificação de tópicos realizada em {len(data)} itens")
+        else:
+            resultados = classificar_topicos(data, tokenizer_7, model_7, thresholds_7, mlb_7)
+            logger.info("Classificação de tópicos realizada em 1 item")
+
+        return jsonify(resultados), 200
+
+    except Exception as e:
+        logger.exception("Erro durante a classificação de tópicos")
+        return jsonify({"erro": str(e)}), 500
+
+
 # ------------------------------- INICIALIZAÇÃO -------------------------------
 
 
 if __name__ == "__main__":
-    logger.info("Servidor Flask iniciado em 0.0.0.0:5060")
+    logger.info("Servidor Flask iniciado em 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5060, debug=False)
